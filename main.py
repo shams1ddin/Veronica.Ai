@@ -3,7 +3,7 @@ import re
 from fastapi import FastAPI, HTTPException, Request, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel
 from typing import List, Dict, Optional
 import uuid
@@ -13,34 +13,41 @@ import base64
 import PyPDF2
 from docx import Document
 import pandas as pd
-import odf
 from odf import text, teletype
-import pyth
+from striprtf.striprtf import rtf_to_text
 import logging
-
+import tempfile
+import mimetypes
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# first api key from openrouter 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
-# second api key from openrouter  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
-# third api key from openrouter  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
-# API Configuration
-API_KEY = "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"
+# API Keys Configuration
+API_KEYS = [
+    {"id": "first api", "key": "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"},
+    {"id": "second api", "key": "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"},
+    {"id": "third api", "key": "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"},
+    {"id": "fourth api", "key": "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"}
+]
+
+# Global variable to track current API key
+current_api_key = API_KEYS[0]["key"]
+current_api_key_id = API_KEYS[0]["id"]
+
 BASE_URL = "https://openrouter.ai/api/v1/chat/completions"
 
 # Models
 DEFAULT_MODEL = "meta-llama/llama-4-maverick:free"
 THINK_MODEL = "google/gemini-2.0-flash-thinking-exp:free"
 MULTIMODAL_MODEL = "qwen/qwen2.5-vl-72b-instruct:free"
-YUPPI_MODEL = "yuppi-ai-model:free"  # Placeholder for Yuppi.AI model
+YUPPI_MODEL = "deepseek/deepseek-chat-v3-0324:free"
 
-HEADERS = {
-    "Authorization": f"Bearer {API_KEY}",
-    "Content-Type": "application/json"
-}
-
+def get_headers():
+    return {
+        "Authorization": f"Bearer {current_api_key}",
+        "Content-Type": "application/json"
+    }
 
 app = FastAPI(title="Veronica AI Assistant")
 
@@ -56,6 +63,7 @@ app.add_middleware(
 )
 
 chat_histories = {}
+uploaded_files = {}
 
 class Message(BaseModel):
     role: str
@@ -70,11 +78,36 @@ class ChatRequest(BaseModel):
     chat_id: Optional[str] = None
     model: Optional[str] = DEFAULT_MODEL
 
+class FileChatRequest(BaseModel):
+    file_url: str
+    query: Optional[str] = None
+    chat_id: Optional[str] = None
+    model: Optional[str] = DEFAULT_MODEL
+
+class MultipleFilesChatRequest(BaseModel):
+    files: List[Dict[str, str]]
+    query: Optional[str] = None
+    chat_id: Optional[str] = None
+    model: Optional[str] = MULTIMODAL_MODEL
+
 class ChatResponse(BaseModel):
     response: str
     chat_id: Optional[str]
     status: str
     processing_time: Optional[float] = None
+    api_key_changed: Optional[bool] = False
+    error: Optional[str] = None
+
+class UploadResponse(BaseModel):
+    url: str
+    filename: str
+
+class APIKeyResponse(BaseModel):
+    keys: List[Dict[str, str]]
+    current_key_id: str
+
+class APIKeySwitchRequest(BaseModel):
+    key_id: str
 
 @app.get("/")
 async def read_root():
@@ -108,50 +141,148 @@ async def clear_all_chats():
     chat_histories.clear()
     return {"status": "success"}
 
-async def get_ai_response(messages: List[dict], model: str) -> str:
+@app.post("/veronica/upload-image", response_model=UploadResponse)
+async def upload_image(file: UploadFile = File(...), chat_id: Optional[str] = Form(None)):
+    filename = file.filename.lower()
+    if not filename.endswith(('.jpg', '.jpeg', '.png', '.gif', '.bmp', '.webp')):
+        raise HTTPException(status_code=400, detail="Unsupported image format")
+    
+    file_id = str(uuid.uuid4())
+    content_type = file.content_type or "image/jpeg"
+    
+    with tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(filename)[1]) as tmp_file:
+        content = await file.read()
+        tmp_file.write(content)
+        tmp_path = tmp_file.name
+    
+    uploaded_files[file_id] = {
+        "path": tmp_path,
+        "filename": filename,
+        "content_type": content_type
+    }
+    
+    file_url = f"/files/{file_id}"
+    
+    return {"url": file_url, "filename": filename}
+
+@app.post("/veronica/upload-document", response_model=UploadResponse)
+async def upload_document(file: UploadFile = File(...), chat_id: Optional[str] = Form(None)):
+    filename = file.filename.lower()
+    supported_extensions = (
+        '.pdf', '.txt', '.docx', '.odt', '.xlsx', '.ods', '.rtf', '.csv',
+        '.html', '.css', '.js', '.json', '.xml', '.yaml', '.yml', '.md',
+        '.py', '.java', '.cpp', '.c', '.cs', '.sql', '.sh', '.bat', '.ts',
+        '.jsx', '.tsx', '.php', '.log', '.ini', '.tex', '.bib'
+    )
+    if not filename.endswith(supported_extensions):
+        raise HTTPException(status_code=400, detail="Unsupported document format")
+    
+    file_id = str(uuid.uuid4())
+    content_type = file.content_type or "application/octet-stream"
+    
+    with tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(filename)[1]) as tmp_file:
+        content = await file.read()
+        tmp_file.write(content)
+        tmp_path = tmp_file.name
+    
+    uploaded_files[file_id] = {
+        "path": tmp_path,
+        "filename": filename,
+        "content_type": content_type
+    }
+    
+    file_url = f"/files/{file_id}"
+    
+    return {"url": file_url, "filename": filename}
+
+@app.get("/files/{file_id}")
+async def get_file(file_id: str):
+    if file_id not in uploaded_files:
+        raise HTTPException(status_code=404, detail="File not found")
+    
+    file_info = uploaded_files[file_id]
+    return FileResponse(
+        path=file_info["path"],
+        filename=file_info["filename"],
+        media_type=file_info["content_type"]
+    )
+
+async def get_ai_response(messages: List[dict], model: str) -> tuple[str, bool]:
+    global current_api_key, current_api_key_id
+    api_key_changed = False
+    current_key_index = next(i for i, key in enumerate(API_KEYS) if key["key"] == current_api_key)
+    
     payload = {
         "stream": False,
         "model": model,
         "messages": messages
     }
     
-    try:
-        async with aiohttp.ClientSession() as session:
-            logger.info(f"Sending request to OpenRouter with model: {model}")
-            async with session.post(BASE_URL, json=payload, headers=HEADERS) as response:
-                if response.status == 200:
-                    response_json = await response.json()
-                    full_response = response_json.get("choices", [{}])[0].get("message", {}).get("content", "")
-                    clean_response = re.sub(r'<think>.*?</think>', '', full_response, flags=re.DOTALL).strip()
+    while True:
+        try:
+            async with aiohttp.ClientSession() as session:
+                logger.info(f"Sending request to OpenRouter with model: {model}, key: {current_api_key_id}")
+                async with session.post(BASE_URL, json=payload, headers=get_headers()) as response:
+                    if response.status == 200:
+                        response_json = await response.json()
+                        full_response = response_json.get("choices", [{}])[0].get("message", {}).get("content", "")
+                        clean_response = re.sub(r'<think>.*?</think>', '', full_response, flags=re.DOTALL).strip()
+                        
+                        if not clean_response:
+                            clean_response = full_response.strip()
+                        
+                        if not clean_response:
+                            raise HTTPException(status_code=500, detail="Empty response from API")
+                        
+                        logger.info(f"Received response: {clean_response[:100]}...")
+                        return clean_response, api_key_changed
                     
-                    if not clean_response:
-                        clean_response = full_response.strip()
+                    elif response.status == 429 or response.status >= 500:  # Rate limit or server error
+                        error_text = await response.text()
+                        logger.warning(f"API Error with key {current_api_key_id}: {error_text}")
+                        
+                        # Try next API key
+                        current_key_index = (current_key_index + 1) % len(API_KEYS)
+                        current_api_key = API_KEYS[current_key_index]["key"]
+                        current_api_key_id = API_KEYS[current_key_index]["id"]
+                        api_key_changed = True
+                        logger.info(f"Switched to API key: {current_api_key_id}")
+                        
+                        if current_key_index == 0:  # We've tried all keys
+                            raise HTTPException(status_code=429, detail="All API keys have reached their limits")
+                        continue
                     
-                    if not clean_response:
-                        raise HTTPException(status_code=500, detail="Empty response from API")
-                    
-                    logger.info(f"Received response: {clean_response[:100]}...")
-                    return clean_response
-                else:
-                    error_text = await response.text()
-                    logger.error(f"API Error: {error_text}")
-                    # Fallback to default model if Think model fails
-                    if model == THINK_MODEL:
-                        logger.info("Falling back to default model due to Think model failure")
-                        payload["model"] = DEFAULT_MODEL
-                        async with session.post(BASE_URL, json=payload, headers=HEADERS) as fallback_response:
-                            if fallback_response.status == 200:
-                                fallback_json = await fallback_response.json()
-                                fallback_response_text = fallback_json.get("choices", [{}])[0].get("message", {}).get("content", "")
-                                return fallback_response_text
-                            else:
-                                fallback_error = await fallback_response.text()
-                                logger.error(f"Fallback API Error: {fallback_error}")
-                                raise HTTPException(status_code=response.status, detail=f"API Error: {error_text}, Fallback Error: {fallback_error}")
-                    raise HTTPException(status_code=response.status, detail=f"API Error: {error_text}")
-    except Exception as e:
-        logger.error(f"Server error: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Server error: {str(e)}")
+                    else:
+                        error_text = await response.text()
+                        logger.error(f"API Error: {error_text}")
+                        if model == THINK_MODEL:
+                            logger.info("Falling back to default model")
+                            payload["model"] = DEFAULT_MODEL
+                            async with session.post(BASE_URL, json=payload, headers=get_headers()) as fallback_response:
+                                if fallback_response.status == 200:
+                                    fallback_json = await fallback_response.json()
+                                    fallback_response_text = fallback_json.get("choices", [{}])[0].get("message", {}).get("content", "")
+                                    return fallback_response_text, api_key_changed
+                                else:
+                                    fallback_error = await fallback_response.text()
+                                    logger.error(f"Fallback API Error: {fallback_error}")
+                                    raise HTTPException(status_code=response.status, detail=f"API Error: {error_text}, Fallback Error: {fallback_error}")
+                        raise HTTPException(status_code=response.status, detail=f"API Error: {error_text}")
+        
+        except Exception as e:
+            logger.error(f"Server error: {str(e)}")
+            if isinstance(e, HTTPException) and e.status_code == 429:
+                # Try next API key
+                current_key_index = (current_key_index + 1) % len(API_KEYS)
+                current_api_key = API_KEYS[current_key_index]["key"]
+                current_api_key_id = API_KEYS[current_key_index]["id"]
+                api_key_changed = True
+                logger.info(f"Switched to API key: {current_api_key_id}")
+                
+                if current_key_index == 0:  # We've tried all keys
+                    raise HTTPException(status_code=429, detail="All API keys have reached their limits")
+                continue
+            raise HTTPException(status_code=500, detail=f"Server error: {str(e)}")
 
 @app.post("/veronica", response_model=ChatResponse)
 async def ask_veronica(request: ChatRequest):
@@ -163,18 +294,16 @@ async def ask_veronica(request: ChatRequest):
         if not query:
             raise HTTPException(status_code=400, detail="Query is required")
 
-        if not API_KEY:
+        if not current_api_key:
             raise HTTPException(status_code=500, detail="API key not found")
 
-        # Map frontend model names to backend models
-        if model == "veronica":
-            model = DEFAULT_MODEL
-        elif model == "yuppi":
-            model = YUPPI_MODEL
-        elif model == THINK_MODEL:
-            model = THINK_MODEL
-        else:
-            model = DEFAULT_MODEL
+        model_map = {
+            "veronica": DEFAULT_MODEL,
+            "yuppi": YUPPI_MODEL,
+            THINK_MODEL: THINK_MODEL,
+            MULTIMODAL_MODEL: MULTIMODAL_MODEL
+        }
+        model = model_map.get(model, DEFAULT_MODEL)
 
         messages = []
         if chat_id:
@@ -204,7 +333,7 @@ async def ask_veronica(request: ChatRequest):
         messages.append(user_message)
         
         start_time = time.time()
-        response_text = await get_ai_response(messages, model)
+        response_text, api_key_changed = await get_ai_response(messages, model)
         processing_time = time.time() - start_time if model == THINK_MODEL else None
         
         assistant_message = {"role": "assistant", "content": response_text}
@@ -217,85 +346,88 @@ async def ask_veronica(request: ChatRequest):
             "response": response_text,
             "chat_id": chat_id,
             "status": "success",
-            "processing_time": processing_time
+            "processing_time": processing_time,
+            "api_key_changed": api_key_changed
         }
 
     except HTTPException as http_exc:
+        if http_exc.status_code == 429:
+            return JSONResponse(
+                status_code=429,
+                content={
+                    "response": "API rate limit exceeded. Please switch API key.",
+                    "status": "error",
+                    "error": str(http_exc.detail),
+                    "api_key_changed": True
+                }
+            )
         raise
     except Exception as e:
         logger.error(f"Server error in ask_veronica: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Server error: {str(e)}")
 
 @app.post("/veronica/chat-with-document", response_model=ChatResponse)
-async def chat_with_document(
-    file: UploadFile = File(...),
-    query: Optional[str] = Form(None),
-    chat_id: Optional[str] = Form(None),
-    model: Optional[str] = Form(DEFAULT_MODEL)
-):
+async def chat_with_document(request: FileChatRequest):
     try:
-        # Map frontend model names to backend models
-        if model == "veronica":
-            model = DEFAULT_MODEL
-        elif model == "yuppi":
-            model = YUPPI_MODEL
-        elif model == THINK_MODEL:
-            model = THINK_MODEL
-        else:
-            model = DEFAULT_MODEL
+        file_url = request.file_url
+        query = request.query
+        chat_id = request.chat_id
+        model = request.model or DEFAULT_MODEL
 
-        # Extract text from the file
+        model_map = {
+            "veronica": DEFAULT_MODEL,
+            "yuppi": YUPPI_MODEL,
+            THINK_MODEL: THINK_MODEL
+        }
+        model = model_map.get(model, DEFAULT_MODEL)
+
+        file_id = file_url.split('/')[-1]
+        if file_id not in uploaded_files:
+            raise HTTPException(status_code=404, detail="File not found")
+
+        file_info = uploaded_files[file_id]
+        filename = file_info["filename"]
+        file_path = file_info["path"]
+
         content = ""
-        filename = file.filename.lower()
-        
-        # Simple text-based files
         if filename.endswith((
             '.txt', '.html', '.css', '.js', '.json', '.xml', '.yaml', '.yml', '.md',
             '.py', '.java', '.cpp', '.c', '.cs', '.sql', '.sh', '.bat', '.ts', '.jsx',
             '.tsx', '.php', '.log', '.ini', '.tex', '.bib'
         )):
-            content = await file.read()
-            content = content.decode('utf-8', errors='ignore')
+            with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
+                content = f.read()
         
-        # PDF files
         elif filename.endswith('.pdf'):
-            pdf_reader = PyPDF2.PdfReader(file.file)
-            content = ""
-            for page in pdf_reader.pages:
-                content += page.extract_text() + "\n"
+            with open(file_path, 'rb') as f:
+                pdf_reader = PyPDF2.PdfReader(f)
+                for page in pdf_reader.pages:
+                    content += page.extract_text() + "\n"
         
-        # Microsoft Word (.docx)
         elif filename.endswith('.docx'):
-            doc = Document(file.file)
+            doc = Document(file_path)
             content = "\n".join([para.text for para in doc.paragraphs])
         
-        # OpenDocument Text (.odt)
         elif filename.endswith('.odt'):
-            doc = odf.opendocument.load(file.file)
-            content = ""
+            doc = odf.opendocument.load(file_path)
             for element in doc.getElementsByType(text.P):
                 content += teletype.extractText(element) + "\n"
         
-        # Excel (.xlsx)
         elif filename.endswith('.xlsx'):
-            df = pd.read_excel(file.file)
+            df = pd.read_excel(file_path)
             content = df.to_string()
         
-        # OpenDocument Spreadsheet (.ods)
         elif filename.endswith('.ods'):
-            doc = odf.opendocument.load(file.file)
-            content = ""
+            doc = odf.opendocument.load(file_path)
             for element in doc.getElementsByType(text.P):
                 content += teletype.extractText(element) + "\n"
         
-        # RTF files
         elif filename.endswith('.rtf'):
-            content = await file.read()
-            content = pyth.rtf_to_text(content.decode('utf-8', errors='ignore'))
+            with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
+                content = rtf_to_text(f.read())
         
-        # CSV files
         elif filename.endswith('.csv'):
-            df = pd.read_csv(file.file)
+            df = pd.read_csv(file_path)
             content = df.to_string()
         
         else:
@@ -304,10 +436,8 @@ async def chat_with_document(
         if not content.strip():
             raise HTTPException(status_code=400, detail="Не удалось извлечь текст из файла")
 
-        # Formulate the query
         full_query = f"Содержимое документа:\n{content}\n\n{query if query else 'Анализируй документ.'}"
         
-        # Send to OpenRouter
         messages = []
         if chat_id:
             if chat_id not in chat_histories:
@@ -335,50 +465,59 @@ async def chat_with_document(
         user_message = {"role": "user", "content": full_query}
         messages.append(user_message)
         
-        response_text = await get_ai_response(messages, model)
+        response_text, api_key_changed = await get_ai_response(messages, model)
 
-        # Save to chat history
         if chat_id:
-            chat_histories[chat_id].append({"role": "user", "content": f"Документ загружен: {file.filename}\n\n{full_query}"})
+            chat_histories[chat_id].append({"role": "user", "content": f"Документ загружен: {filename}\n\n{full_query}"})
             chat_histories[chat_id].append({"role": "assistant", "content": response_text})
 
         return {
             "response": response_text,
             "chat_id": chat_id,
-            "status": "success"
+            "status": "success",
+            "api_key_changed": api_key_changed
         }
 
     except HTTPException as http_exc:
+        if http_exc.status_code == 429:
+            return JSONResponse(
+                status_code=429,
+                content={
+                    "response": "API rate limit exceeded. Please switch API key.",
+                    "status": "error",
+                    "error": str(http_exc.detail),
+                    "api_key_changed": True
+                }
+            )
         raise
     except Exception as e:
         logger.error(f"Error processing document: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Error processing document: {str(e)}")
 
 @app.post("/veronica/chat-with-image", response_model=ChatResponse)
-async def chat_with_image(
-    file: UploadFile = File(...),
-    query: Optional[str] = Form(None),
-    chat_id: Optional[str] = Form(None),
-    model: Optional[str] = Form(None)
-):
+async def chat_with_image(request: FileChatRequest):
     try:
-        # Use the default multimodal model if none is specified
-        if not model:
-            model = MULTIMODAL_MODEL
-        elif model not in [MULTIMODAL_MODEL, "google/gemini-2.5-pro-exp-03-25:free"]:
-            raise HTTPException(status_code=400, detail="Модель не поддерживает обработку изображений. Выберите мультимодальную модель (например, qwen/qwen2.5-vl-72b-instruct:free).")
+        file_url = request.file_url
+        query = request.query
+        chat_id = request.chat_id
+        model = request.model or MULTIMODAL_MODEL
 
-        # Validate image format
-        filename = file.filename.lower()
-        if not filename.endswith(('.jpg', '.jpeg', '.png', '.gif', '.bmp', '.webp')):
-            raise HTTPException(status_code=400, detail="Unsupported image format. Supported formats: .jpg, .jpeg, .png, .gif, .bmp, .webp")
+        if model not in [MULTIMODAL_MODEL, "google/gemini-2.5-pro-exp-03-25:free"]:
+            raise HTTPException(status_code=400, detail="Модель не поддерживает обработку изображений")
 
-        # Encode image to base64
-        image_content = await file.read()
+        file_id = file_url.split('/')[-1]
+        if file_id not in uploaded_files:
+            raise HTTPException(status_code=404, detail="File not found")
+
+        file_info = uploaded_files[file_id]
+        filename = file_info["filename"]
+        file_path = file_info["path"]
+        content_type = file_info["content_type"]
+
+        with open(file_path, 'rb') as f:
+            image_content = f.read()
         base64_image = base64.b64encode(image_content).decode('utf-8')
-        content_type = file.content_type or "image/jpeg"
 
-        # Formulate the request
         message_content = [
             {"type": "text", "text": query or "Опиши изображение."},
             {
@@ -415,42 +554,132 @@ async def chat_with_image(
 
         messages.append({"role": "user", "content": message_content})
 
-        # Send to OpenRouter
-        payload = {
-            "stream": False,
-            "model": model,
-            "messages": messages
-        }
-        
-        async with aiohttp.ClientSession() as session:
-            logger.info(f"Sending image request to OpenRouter with model: {model}")
-            async with session.post(BASE_URL, json=payload, headers=HEADERS) as response:
-                if response.status == 200:
-                    response_json = await response.json()
-                    response_text = response_json.get("choices", [{}])[0].get("message", {}).get("content", "")
-                    if not response_text:
-                        raise HTTPException(status_code=500, detail="Empty response from API")
-                else:
-                    error_text = await response.text()
-                    logger.error(f"Image API Error: {error_text}")
-                    raise HTTPException(status_code=response.status, detail=f"API Error: {error_text}")
+        response_text, api_key_changed = await get_ai_response(messages, model)
 
-        # Save to chat history
         if chat_id:
-            chat_histories[chat_id].append({"role": "user", "content": f"Изображение загружено: {file.filename}"})
+            chat_histories[chat_id].append({"role": "user", "content": f"Изображение загружено: {filename}"})
             chat_histories[chat_id].append({"role": "assistant", "content": response_text})
 
         return {
             "response": response_text,
             "chat_id": chat_id,
-            "status": "success"
+            "status": "success",
+            "api_key_changed": api_key_changed
         }
 
     except HTTPException as http_exc:
+        if http_exc.status_code == 429:
+            return JSONResponse(
+                status_code=429,
+                content={
+                    "response": "API rate limit exceeded. Please switch API key.",
+                    "status": "error",
+                    "error": str(http_exc.detail),
+                    "api_key_changed": True
+                }
+            )
         raise
     except Exception as e:
         logger.error(f"Error processing image: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Error processing image: {str(e)}")
+
+@app.post("/veronica/chat-with-multiple-images", response_model=ChatResponse)
+async def chat_with_multiple_images(request: MultipleFilesChatRequest):
+    try:
+        files = request.files
+        query = request.query
+        chat_id = request.chat_id
+        model = request.model or MULTIMODAL_MODEL
+
+        if model not in [MULTIMODAL_MODEL, "google/gemini-2.5-pro-exp-03-25:free"]:
+            raise HTTPException(status_code=400, detail="Модель не поддерживает обработку изображений")
+
+        if not files:
+            raise HTTPException(status_code=400, detail="At least one file is required")
+
+        message_content = [{"type": "text", "text": query or "Проанализируй все эти изображения вместе и опиши их."}]
+        
+        for file_info in files:
+            file_url = file_info.get("file_url")
+            if not file_url:
+                continue
+                
+            file_id = file_url.split('/')[-1]
+            if file_id not in uploaded_files:
+                continue
+
+            file_data = uploaded_files[file_id]
+            with open(file_data["path"], 'rb') as f:
+                image_content = f.read()
+            base64_image = base64.b64encode(image_content).decode('utf-8')
+            
+            message_content.append({
+                "type": "image_url",
+                "image_url": {
+                    "url": f"data:{file_data['content_type']};base64,{base64_image}"
+                }
+            })
+        
+        messages = []
+        if chat_id:
+            if chat_id not in chat_histories:
+                chat_histories[chat_id] = []
+            messages = chat_histories[chat_id].copy()
+
+        if not any(msg.get("role") == "system" for msg in messages):
+            system_message = {
+                "role": "system", 
+                "content": """Ты - помощник, который анализирует несколько изображений одновременно. 
+                При ответе:
+                1. Сначала проанализируй все изображения вместе
+                2. Найди связи между изображениями
+                3. Дай общий контекстный ответ, учитывающий все изображения
+                4. Если есть особенности или детали в отдельных изображениях - укажи их
+                
+                Используй markdown для форматирования:
+                - **жирный** для выделения
+                - *курсив* для подчеркивания
+                - Заголовки с #
+                - Списки с - или *
+                - Нумерованные списки с 1. 2. 3.
+                
+                Давай четкие и понятные ответы."""
+            }
+            messages.insert(0, system_message)
+
+        messages.append({"role": "user", "content": message_content})
+
+        response_text, api_key_changed = await get_ai_response(messages, model)
+
+        if chat_id:
+            chat_histories[chat_id].append({
+                "role": "user", 
+                "content": f"Загружено несколько изображений для анализа: {', '.join(f['filename'] for f in [uploaded_files[url.split('/')[-1]] for url in [f['file_url'] for f in files]])}"
+            })
+            chat_histories[chat_id].append({"role": "assistant", "content": response_text})
+
+        return {
+            "response": response_text,
+            "chat_id": chat_id,
+            "status": "success",
+            "api_key_changed": api_key_changed
+        }
+
+    except HTTPException as http_exc:
+        if http_exc.status_code == 429:
+            return JSONResponse(
+                status_code=429,
+                content={
+                    "response": "API rate limit exceeded. Please switch API key.",
+                    "status": "error",
+                    "error": str(http_exc.detail),
+                    "api_key_changed": True
+                }
+            )
+        raise
+    except Exception as e:
+        logger.error(f"Error processing multiple images: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Error processing multiple images: {str(e)}")
 
 @app.get("/veronica/models")
 async def get_models():
@@ -462,6 +691,27 @@ async def get_models():
         "think_model": THINK_MODEL,
         "multimodal_model": MULTIMODAL_MODEL
     }
+
+@app.get("/veronica/api-keys", response_model=APIKeyResponse)
+async def get_api_keys():
+    return {
+        "keys": [{"id": key["id"], "name": key["id"]} for key in API_KEYS],
+        "current_key_id": current_api_key_id
+    }
+
+@app.post("/veronica/switch-api-key")
+async def switch_api_key(request: APIKeySwitchRequest):
+    global current_api_key, current_api_key_id
+    key_id = request.key_id
+    key_info = next((key for key in API_KEYS if key["id"] == key_id), None)
+    if not key_info:
+        raise HTTPException(status_code=404, detail="API key not found")
+    
+    current_api_key = key_info["key"]
+    current_api_key_id = key_info["id"]
+    logger.info(f"Manually switched to API key: {current_api_key_id}")
+    
+    return {"status": "success", "current_key_id": current_api_key_id}
 
 if __name__ == "__main__":
     import uvicorn
