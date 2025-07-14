@@ -18,6 +18,7 @@ from striprtf.striprtf import rtf_to_text
 import logging
 import tempfile
 import mimetypes
+import json
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -25,11 +26,19 @@ logger = logging.getLogger(__name__)
 
 # API Keys Configuration
 API_KEYS = [
-    {"id": "first api", "key": "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"},
-    {"id": "second api", "key": "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"},
+    {"id": "first api", "key": "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"},
+    {"id": "second api", "key": "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"},
     {"id": "third api", "key": "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"},
     {"id": "fourth api", "key": "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"}
 ]
+
+# Google Custom Search API Configuration
+GOOGLE_API_KEY = "AIzaSyBsT2LWAus5KJ2gCagkZSYORm8QA8IgMJs"
+GOOGLE_SEARCH_ENGINE_ID = "531f88e98ea35413d"
+
+# Hugging Face API Configuration
+HUGGING_FACE_API_KEY = "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"
+IMAGE_GEN_MODEL = "black-forest-labs/FLUX.1-schnell"
 
 # Global variable to track current API key
 current_api_key = API_KEYS[0]["key"]
@@ -38,7 +47,7 @@ current_api_key_id = API_KEYS[0]["id"]
 BASE_URL = "https://openrouter.ai/api/v1/chat/completions"
 
 # Models
-DEFAULT_MODEL = "meta-llama/llama-4-maverick:free"
+DEFAULT_MODEL = "deepseek/deepseek-chat-v3-0324:free"
 THINK_MODEL = "google/gemini-2.0-flash-thinking-exp:free"
 MULTIMODAL_MODEL = "qwen/qwen2.5-vl-72b-instruct:free"
 YUPPI_MODEL = "deepseek/deepseek-chat-v3-0324:free"
@@ -108,6 +117,16 @@ class APIKeyResponse(BaseModel):
 
 class APIKeySwitchRequest(BaseModel):
     key_id: str
+
+class DeepSearchRequest(BaseModel):
+    query: str
+    chat_id: Optional[str] = None
+    model: Optional[str] = DEFAULT_MODEL
+
+class ImageGenerationRequest(BaseModel):
+    prompt: str
+    chat_id: Optional[str] = None
+    model: Optional[str] = IMAGE_GEN_MODEL
 
 @app.get("/")
 async def read_root():
@@ -712,6 +731,180 @@ async def switch_api_key(request: APIKeySwitchRequest):
     logger.info(f"Manually switched to API key: {current_api_key_id}")
     
     return {"status": "success", "current_key_id": current_api_key_id}
+
+@app.post("/veronica/deepsearch", response_model=ChatResponse)
+async def deep_search(request: DeepSearchRequest):
+    try:
+        query = request.query
+        chat_id = request.chat_id
+        model = request.model or DEFAULT_MODEL
+        
+        # Проверяем, что модель поддерживает DeepSearch
+        model_map = {
+            "veronica": DEFAULT_MODEL,
+            "yuppi": YUPPI_MODEL,
+            THINK_MODEL: THINK_MODEL,
+            MULTIMODAL_MODEL: MULTIMODAL_MODEL
+        }
+        model = model_map.get(model, DEFAULT_MODEL)
+
+        if not query:
+            raise HTTPException(status_code=400, detail="Query is required")
+
+        # Выполняем поиск через Google Custom Search API
+        search_url = f"https://www.googleapis.com/customsearch/v1?key={GOOGLE_API_KEY}&cx={GOOGLE_SEARCH_ENGINE_ID}&q={query}"
+        
+        async with aiohttp.ClientSession() as session:
+            async with session.get(search_url) as response:
+                if response.status != 200:
+                    error_text = await response.text()
+                    logger.error(f"Google Search API Error: {error_text}")
+                    raise HTTPException(status_code=response.status, detail=f"Google Search API Error: {error_text}")
+                
+                search_results = await response.json()
+
+        # Формируем результаты поиска для анализа ИИ
+        search_content = ""
+        
+        if "items" in search_results and len(search_results["items"]) > 0:
+            search_content += "# Результаты веб поиска\n\n"
+            
+            for i, item in enumerate(search_results["items"], 1):
+                title = item.get("title", "Без заголовка")
+                link = item.get("link", "#")
+                snippet = item.get("snippet", "Нет описания")
+                
+                search_content += f"## {i}. [{title}]({link})\n"
+                search_content += f"{snippet}\n\n"
+        else:
+            search_content += "По вашему запросу ничего не найдено.\n"
+
+        # Создаем сообщения для отправки в модель ИИ
+        messages = []
+        system_message = {
+            "role": "system", 
+            "content": """Ты - помощник с функцией DeepSearch, который анализирует результаты веб-поиска и дает на их основе полезные ответы.
+            При ответе:
+            1. Проанализируй все результаты поиска
+            2. Выдели ключевую информацию по запросу пользователя
+            3. Структурируй ответ логически
+            4. Если информации недостаточно, укажи это
+            5. Всегда указывай источники информации
+            
+            Используй markdown для форматирования:
+            - **жирный** для выделения
+            - *курсив* для подчеркивания
+            - Заголовки с #
+            - Списки с - или *
+            - Нумерованные списки с 1. 2. 3.
+            
+            Давай четкие и понятные ответы."""
+        }
+        
+        messages.append(system_message)
+        messages.append({"role": "user", "content": f"Запрос пользователя: {query}\n\nРезультаты поиска:\n{search_content}"})
+        
+        # Получаем ответ от модели ИИ
+        start_time = time.time()
+        response_text, api_key_changed = await get_ai_response(messages, model)
+        processing_time = time.time() - start_time
+        
+        # Сохраняем в историю чата, если указан chat_id
+        if chat_id:
+            if chat_id not in chat_histories:
+                chat_histories[chat_id] = []
+            
+            chat_histories[chat_id].append({"role": "user", "content": f"DeepSearch: {query}"})
+            chat_histories[chat_id].append({"role": "assistant", "content": response_text})
+
+        return {
+            "response": response_text,
+            "chat_id": chat_id,
+            "status": "success",
+            "processing_time": processing_time,
+            "api_key_changed": api_key_changed
+        }
+
+    except HTTPException as http_exc:
+        raise
+    except Exception as e:
+        logger.error(f"Server error in deep_search: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Server error: {str(e)}")
+
+@app.post("/veronica/generate-image", response_model=ChatResponse)
+async def generate_image(request: ImageGenerationRequest):
+    try:
+        prompt = request.prompt
+        chat_id = request.chat_id
+        model = request.model or IMAGE_GEN_MODEL
+
+        if not prompt:
+            raise HTTPException(status_code=400, detail="Prompt is required")
+
+        # Запрос к Hugging Face API для генерации изображения
+        headers = {
+            "Authorization": f"Bearer {HUGGING_FACE_API_KEY}"
+        }
+
+        payload = {
+            "inputs": prompt,
+            "parameters": {
+                "negative_prompt": "blurry, bad quality, distorted",
+                "guidance_scale": 7.5,
+                "num_inference_steps": 30
+            }
+        }
+
+        async with aiohttp.ClientSession() as session:
+            logger.info(f"Sending image generation request to Hugging Face with model: {model}")
+            api_url = f"https://api-inference.huggingface.co/models/{model}"
+            
+            async with session.post(api_url, headers=headers, json=payload) as response:
+                if response.status == 200:
+                    # Получаем изображение в виде байтов
+                    image_bytes = await response.read()
+                    
+                    # Сохраняем изображение во временный файл
+                    file_id = str(uuid.uuid4())
+                    image_filename = f"generated_image_{file_id}.png"
+                    
+                    with tempfile.NamedTemporaryFile(delete=False, suffix=".png") as tmp_file:
+                        tmp_file.write(image_bytes)
+                        tmp_path = tmp_file.name
+                    
+                    # Сохраняем информацию о файле
+                    uploaded_files[file_id] = {
+                        "path": tmp_path,
+                        "filename": image_filename,
+                        "content_type": "image/png"
+                    }
+                    
+                    file_url = f"/files/{file_id}"
+                    response_text = f"![Generated Image]({file_url})\n\nИзображение успешно сгенерировано по запросу: **{prompt}**"
+                    
+                    # Сохраняем в историю чата, если указан chat_id
+                    if chat_id:
+                        if chat_id not in chat_histories:
+                            chat_histories[chat_id] = []
+                        
+                        chat_histories[chat_id].append({"role": "user", "content": f"Сгенерировать изображение: {prompt}"})
+                        chat_histories[chat_id].append({"role": "assistant", "content": response_text})
+                    
+                    return {
+                        "response": response_text,
+                        "chat_id": chat_id,
+                        "status": "success"
+                    }
+                else:
+                    error_text = await response.text()
+                    logger.error(f"Hugging Face API Error: {error_text}")
+                    raise HTTPException(status_code=response.status, detail=f"Hugging Face API Error: {error_text}")
+
+    except HTTPException as http_exc:
+        raise
+    except Exception as e:
+        logger.error(f"Server error in generate_image: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Server error: {str(e)}")
 
 if __name__ == "__main__":
     import uvicorn
