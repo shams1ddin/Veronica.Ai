@@ -1,0 +1,10 @@
+fastapi==0.115.0 
+uvicorn==0.30.6 
+aiohttp==3.10.5 
+pydantic==2.9.2 
+PyPDF2==3.0.1 
+python-docx==1.1.2 
+pandas==2.2.2 
+odfpy==1.4.1 
+striprtf==0.0.26 
+python-magic==0.4.27
